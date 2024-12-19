@@ -67,30 +67,47 @@ def process_tool_call(tool_call, functions_or_models, fix_json_args=True, case_i
     error = None
     stack_trace = None
     output = None
+
+    tool = None
+    for f in functions_or_models:
+        fname = get_name(f, case_insensitive=case_insensitive)
+        if fname == tool_name:
+            tool = f
+            break
+    if not tool:
+        error = NoMatchingTool(f"Function {tool_name} not found")
+        return ToolResult(
+            tool_call_id=tool_call.id,
+            name=tool_name,
+            error=error,
+        )
+
     try:
         tool_args = json.loads(args)
     except json.decoder.JSONDecodeError as e:
         if fix_json_args:
             soft_errors.append(e)
             args = args.replace(', }', '}').replace(',}', '}')
-            tool_args = json.loads(args)
+            # Handle case where args are wrapped in parentheses like ("something")
+            if args.startswith('(') and args.endswith(')'):
+                args = args[1:-1]
+            try:
+                tool_args = json.loads(args)
+            except json.decoder.JSONDecodeError as e:
+                stack_trace = traceback.format_exc()
+                return ToolResult(tool_call_id=tool_call.id, name=tool_name, error=e, stack_trace=stack_trace)
         else:
             stack_trace = traceback.format_exc()
             return ToolResult(tool_call_id=tool_call.id, name=tool_name, error=e, stack_trace=stack_trace)
 
-    tool = None
-    for f in functions_or_models:
-        if get_name(f, case_insensitive=case_insensitive) == tool_name:
-            tool = f
-            try:
-                output, new_soft_errors = _process_unpacked(f, tool_args, fix_json_args=fix_json_args)
-                soft_errors.extend(new_soft_errors)
-            except Exception as e:
-                error = e
-                stack_trace = traceback.format_exc()
-            break
-    else:
-        error = NoMatchingTool(f"Function {tool_name} not found")
+    try:
+        output, new_soft_errors = _process_unpacked(f, tool_args, fix_json_args=fix_json_args)
+        soft_errors.extend(new_soft_errors)
+    except Exception as e:
+        error = e
+        stack_trace = traceback.format_exc()
+        return ToolResult(tool_call_id=tool_call.id, name=tool_name, error=e, stack_trace=stack_trace)
+
     result = ToolResult(
         tool_call_id=tool_call.id, 
         name=tool_name,
@@ -116,13 +133,17 @@ def _process_unpacked(function, tool_args={}, fix_json_args=True):
     model = parameters_basemodel_from_function(function)
     soft_errors = []
     if fix_json_args:
-        for field, field_info in model.model_fields.items():
+        model_fields = model.model_fields
+        for field, field_info in model_fields.items():
             field_annotation = field_info.annotation
             if _is_list_type(field_annotation):
                 if field in tool_args and isinstance(tool_args[field], str):
                     # this happens in Claude from Anthropic 
                     tool_args[field] = split_string_to_list(tool_args[field])
                     soft_errors.append(f"Fixed JSON decode error for field {field}")
+        if len(model_fields) == 1 and isinstance(tool_args, str):
+            tool_args = {list(model_fields.keys())[0]: tool_args}
+            soft_errors.append(f"Fixed JSON decode error for field {field}")
 
     model_instance = model(**tool_args)
     args = {}
