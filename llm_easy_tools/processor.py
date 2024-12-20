@@ -60,96 +60,105 @@ class ToolResult:
         }
 
 def process_tool_call(tool_call, functions_or_models, fix_json_args=True, case_insensitive=False) -> ToolResult:
+    """
+    Processes a single tool call by:
+    1. Finding the matching tool by name.
+    2. Creating the model from the tool's signature.
+    3. Parsing the JSON arguments (and optionally fixing them if fix_json_args is True).
+    4. Fixing fields (e.g., converting stringified lists) directly here.
+    5. Validating against the model and calling the function.
+
+    All errors are caught once and returned as part of the ToolResult.
+    """
     function_call = tool_call.function
     tool_name = function_call.name
-    args = function_call.arguments
-    soft_errors: list[Exception] = []
-    error = None
-    stack_trace = None
-    output = None
+    args_str = function_call.arguments
 
+    # Find the tool
     tool = None
     for f in functions_or_models:
         fname = get_name(f, case_insensitive=case_insensitive)
         if fname == tool_name:
             tool = f
             break
+
     if not tool:
-        error = NoMatchingTool(f"Function {tool_name} not found")
         return ToolResult(
             tool_call_id=tool_call.id,
             name=tool_name,
-            error=error,
+            error=NoMatchingTool(f"Function {tool_name} not found"),
         )
 
-    try:
-        tool_args = json.loads(args)
-    except json.decoder.JSONDecodeError as e:
-        if fix_json_args:
-            soft_errors.append(e)
-            args = args.replace(', }', '}').replace(',}', '}')
-            # Handle case where args are wrapped in parentheses like ("something")
-            if args.startswith('(') and args.endswith(')'):
-                args = args[1:-1]
-            try:
-                tool_args = json.loads(args)
-            except json.decoder.JSONDecodeError as e:
-                stack_trace = traceback.format_exc()
-                return ToolResult(tool_call_id=tool_call.id, name=tool_name, error=e, stack_trace=stack_trace)
-        else:
-            stack_trace = traceback.format_exc()
-            return ToolResult(tool_call_id=tool_call.id, name=tool_name, error=e, stack_trace=stack_trace)
-
-    try:
-        output, new_soft_errors = _process_unpacked(f, tool_args, fix_json_args=fix_json_args)
-        soft_errors.extend(new_soft_errors)
-    except Exception as e:
-        error = e
-        stack_trace = traceback.format_exc()
-        return ToolResult(tool_call_id=tool_call.id, name=tool_name, error=e, stack_trace=stack_trace)
-
-    result = ToolResult(
-        tool_call_id=tool_call.id, 
-        name=tool_name,
-        arguments=tool_args,
-        output=output, 
-        error=error,
-        stack_trace=stack_trace,
-        soft_errors=soft_errors,
-        tool=tool,
-    )
-    return result
-
-def split_string_to_list(s: str) -> list[str]:
-    try:
-        # Claude sometimes returns double JSON encoding of lists
-        return json.loads(s)
-    except json.JSONDecodeError:
-        return [item.strip() for item in s.split(',')]
-
-def _process_unpacked(function, tool_args={}, fix_json_args=True):
-    if isinstance(function, LLMFunction):
-        function = function.func
-    model = parameters_basemodel_from_function(function)
     soft_errors = []
-    if fix_json_args:
+    try:
+        # Create the model
+        actual_function = tool.func if isinstance(tool, LLMFunction) else tool
+        model = parameters_basemodel_from_function(actual_function)
+
+        # Parse the arguments
+        try:
+            tool_args = json.loads(args_str)
+        except json.JSONDecodeError as e:
+            if not fix_json_args:
+                raise
+            # Attempt minimal fixes if allowed
+            soft_errors.append(str(e))
+            fixed_args = args_str.replace(', }', '}').replace(',}', '}')
+            if fixed_args.startswith('(') and fixed_args.endswith(')'):
+                fixed_args = fixed_args[1:-1]
+            tool_args = json.loads(fixed_args)  # If this fails, it will raise naturally
+
+        # If there's only one field in the model and tool_args is a string, wrap it in a dict
         model_fields = model.model_fields
+        if len(model_fields) == 1 and isinstance(tool_args, str):
+            only_field = list(model_fields.keys())[0]
+            tool_args = {only_field: tool_args}
+            soft_errors.append(f"Fixed single-field JSON decode issue for field '{only_field}'.")
+
+        # Convert stringified lists to lists if needed
         for field, field_info in model_fields.items():
             field_annotation = field_info.annotation
-            if _is_list_type(field_annotation):
-                if field in tool_args and isinstance(tool_args[field], str):
-                    # this happens in Claude from Anthropic 
-                    tool_args[field] = split_string_to_list(tool_args[field])
-                    soft_errors.append(f"Fixed JSON decode error for field {field}")
-        if len(model_fields) == 1 and isinstance(tool_args, str):
-            tool_args = {list(model_fields.keys())[0]: tool_args}
-            soft_errors.append(f"Fixed JSON decode error for field {field}")
+            if fix_json_args and _is_list_type(field_annotation) and field in tool_args and isinstance(tool_args[field], str):
+                tool_args[field] = split_string_to_list(tool_args[field])
+                soft_errors.append(f"Fixed JSON decode issue for field '{field}'.")
+
+        # Validate and call the function
+        output = _process_unpacked(tool, tool_args, model)
+
+        return ToolResult(
+            tool_call_id=tool_call.id,
+            name=tool_name,
+            arguments=tool_args,
+            output=output,
+            soft_errors=soft_errors,
+            tool=tool,
+        )
+
+    except Exception as e:
+        stack_trace = traceback.format_exc()
+        return ToolResult(
+            tool_call_id=tool_call.id,
+            name=tool_name,
+            error=e,
+            stack_trace=stack_trace,
+            soft_errors=soft_errors,
+            tool=tool,
+        )
+
+
+def _process_unpacked(function, tool_args: dict, model) -> Any:
+    """
+    Validates the provided arguments against the function's model and calls the function.
+    Expects already-fixed tool_args and a pre-created model.
+    Raises exceptions if validation fails.
+    """
+    if isinstance(function, LLMFunction):
+        function = function.func
 
     model_instance = model(**tool_args)
-    args = {}
-    for field, _ in model.model_fields.items():
-        args[field] = getattr(model_instance, field)
-    return function(**args), soft_errors
+    call_args = {field: getattr(model_instance, field) for field in model.model_fields.keys()}
+    return function(**call_args)
+
 
 def _is_list_type(annotation):
     origin = get_origin(annotation)
@@ -160,6 +169,13 @@ def _is_list_type(annotation):
     elif origin is Union or origin is Optional:
         return any(_is_list_type(arg) for arg in args)
     return False
+
+def split_string_to_list(s: str) -> list[str]:
+    try:
+        # Claude sometimes returns double JSON encoding of lists
+        return json.loads(s)
+    except json.JSONDecodeError:
+        return [item.strip() for item in s.split(',')]
 
 def process_response( response: ChatCompletion, functions: list[Union[Callable, LLMFunction]], choice_num=0, **kwargs) -> list[ToolResult]:
     """
